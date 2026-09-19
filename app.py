@@ -6,20 +6,20 @@ import base64
 import hmac
 import os
 import sys
-import time
 
 # ================= 配置区 =================
-PROXY_USER = os.environ.get("PROXY_USER", "admin")
-PROXY_PASS = os.environ.get("PROXY_PASS", "123456")
+PROXY_USER = os.environ.get("PROXY_USER", "scroam")
+PROXY_PASS = os.environ.get("PROXY_PASS", "czh20110127")
 LISTEN_HOST = os.environ.get("PROXY_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("PROXY_PORT", "20364"))
 
 VERBOSE = os.environ.get("PROXY_VERBOSE", "false").lower() == "true"
 
 BUFFER_SIZE = 8192
-IDLE_TIMEOUT = 30          # 空闲超时
-CONNECT_TIMEOUT = 10       # 连接目标超时
-MAX_CONCURRENT = 500       # 最大并发连接数
+IDLE_TIMEOUT = 300          # ★ 空闲超时改为 5 分钟
+CONNECT_TIMEOUT = 10
+MAX_CONCURRENT = 500
+MAX_BUFFER = 4 * 1024 * 1024   # ★ 单方向缓冲上限 4MB
 # ==========================================
 
 semaphore = threading.Semaphore(MAX_CONCURRENT)
@@ -100,45 +100,66 @@ def close_socket(sock):
 
 def tunnel(client_socket, server_socket):
     """
-    双向隧道：socket 保持 blocking，只靠 select 等可读。
-    任意一方断开或空闲超时，整条隧道立即销毁。
+    完全非阻塞双向转发：
+      - select 监听可读 + 可写
+      - 数据积压在 pending 缓冲里，等对端可写时慢慢发
+      - 双向都空闲超过 IDLE_TIMEOUT 才回收
+      - 慢连接不会因为 sendall 超时被强断
     """
-    # 用带超时的阻塞模式：sendall 阻塞有上限，recv 也能被 select 保护
-    client_socket.settimeout(IDLE_TIMEOUT)
-    server_socket.settimeout(IDLE_TIMEOUT)
+    client_socket.setblocking(False)
+    server_socket.setblocking(False)
+
+    peer = {client_socket: server_socket, server_socket: client_socket}
+    pending = {client_socket: b"", server_socket: b""}
 
     while True:
+        # 只在有数据积压时才关心可写事件
+        write_list = [s for s in (client_socket, server_socket) if pending[s]]
+
         try:
-            rlist, _, xlist = select.select(
+            rlist, wlist, xlist = select.select(
                 [client_socket, server_socket],
-                [],
+                write_list,
                 [client_socket, server_socket],
-                IDLE_TIMEOUT
+                IDLE_TIMEOUT,
             )
         except (OSError, ValueError):
             return
 
         if xlist:
             return
-        if not rlist:
-            # 空闲超时，回收
+        if not rlist and not wlist:
+            # 双向都空闲，超时回收
             return
 
+        # ---- 读方向 ----
         for s in rlist:
+            # 缓冲已经积压太多就先不读，等对端消费
+            if len(pending[peer[s]]) > MAX_BUFFER:
+                continue
             try:
                 data = s.recv(BUFFER_SIZE)
-            except (socket.timeout, ConnectionResetError, BrokenPipeError, OSError):
+            except (BlockingIOError, InterruptedError):
+                continue
+            except Exception:
                 return
-
             if not data:
-                # 一方关闭，整条隧道结束
+                # 一方关闭读端，整条隧道结束
                 return
+            pending[peer[s]] += data
 
-            other = server_socket if s is client_socket else client_socket
+        # ---- 写方向 ----
+        for s in wlist:
+            buf = pending[s]
+            if not buf:
+                continue
             try:
-                other.sendall(data)
-            except (socket.timeout, ConnectionResetError, BrokenPipeError, OSError):
+                n = s.send(buf)
+            except (BlockingIOError, InterruptedError):
+                continue
+            except Exception:
                 return
+            pending[s] = buf[n:]
 
 
 def handle_connect(client_socket, hostname, port):
@@ -192,24 +213,24 @@ def handle_http(client_socket, request_data, url):
             close_socket(server_socket)
         return
 
+    # ★ 普通 HTTP 也改成双向隧道，不再手工 recv/sendall
+    #   先握手：把去掉认证头的请求原样发给服务器
     try:
         forward_data = remove_proxy_auth_header(request_data)
         server_socket.sendall(forward_data)
-        server_socket.settimeout(IDLE_TIMEOUT)
-        while True:
-            response_data = server_socket.recv(BUFFER_SIZE)
-            if not response_data:
-                break
-            client_socket.sendall(response_data)
     except Exception:
-        pass
+        close_socket(server_socket)
+        return
+
+    try:
+        tunnel(client_socket, server_socket)
     finally:
         close_socket(server_socket)
 
 
 def handle_client(client_socket, client_address):
     try:
-        client_socket.settimeout(IDLE_TIMEOUT)
+        client_socket.settimeout(CONNECT_TIMEOUT)
         request_data = client_socket.recv(BUFFER_SIZE)
         if not request_data:
             return
@@ -252,7 +273,7 @@ def main():
 
     print(f"代理服务器已启动：{LISTEN_HOST}:{LISTEN_PORT}")
     print(f"用户：{PROXY_USER}  VERBOSE：{VERBOSE}")
-    print(f"空闲超时：{IDLE_TIMEOUT}s  最大并发：{MAX_CONCURRENT}")
+    print(f"空闲超时：{IDLE_TIMEOUT}s  最大并发：{MAX_CONCURRENT}  单方向缓冲上限：{MAX_BUFFER}")
     print("-" * 50, flush=True)
 
     while True:

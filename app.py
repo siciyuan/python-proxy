@@ -9,8 +9,8 @@ import sys
 import time
 
 # ================= 配置区 =================
-PROXY_USER = os.environ.get("PROXY_USER", "scroam")
-PROXY_PASS = os.environ.get("PROXY_PASS", "czh20110127")
+PROXY_USER = os.environ.get("PROXY_USER", "")
+PROXY_PASS = os.environ.get("PROXY_PASS", "")
 LISTEN_HOST = os.environ.get("PROXY_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("PROXY_PORT", "20364"))
 

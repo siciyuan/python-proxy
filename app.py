@@ -12,7 +12,7 @@ import time
 PROXY_USER = os.environ.get("PROXY_USER", "")
 PROXY_PASS = os.environ.get("PROXY_PASS", "")
 LISTEN_HOST = os.environ.get("PROXY_HOST", "0.0.0.0")
-LISTEN_PORT = int(os.environ.get("PROXY_PORT", "20364"))
+LISTEN_PORT = int(os.environ.get("PROXY_PORT", "80"))
 
 VERBOSE = os.environ.get("PROXY_VERBOSE", "false").lower() == "true"
 

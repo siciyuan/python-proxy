@@ -7,6 +7,7 @@ import hmac
 import os
 import sys
 import time
+import random
 
 # ================= 配置区 =================
 PROXY_USER = os.environ.get("PROXY_USER", "")
@@ -17,15 +18,69 @@ LISTEN_PORT = int(os.environ.get("PROXY_PORT", "3000"))
 VERBOSE = os.environ.get("PROXY_VERBOSE", "false").lower() == "true"
 
 BUFFER_SIZE = 8192
-IDLE_TIMEOUT = 120             # 空闲超时（秒），折中：不剪断 keep-alive，又能及时回收僵尸连接
+IDLE_TIMEOUT = 120
 CONNECT_TIMEOUT = 10
 MAX_CONCURRENT = 400
-MAX_BUFFER = 2 * 1024 * 1024   # 单方向缓冲上限 2MB
+MAX_BUFFER = 2 * 1024 * 1024
 # ==========================================
 
 semaphore = threading.Semaphore(MAX_CONCURRENT)
 _alive_threads = 0
 _alive_lock = threading.Lock()
+
+# ================= 伪装站点 =================
+_FAKE_TITLES = [
+    "Docs · Engineering Notes",
+    "Release Notes",
+    "Runtime Handbook",
+    "Edge Infrastructure Docs",
+    "Build Log Mirror",
+    "Internal Documentation",
+]
+
+_FAKE_PAGE_TPL = b"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>__TITLE__</title>
+<style>
+:root{--bg:#ffffff;--fg:#1f2328;--muted:#57606a;--line:#d0d7de}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;color:var(--fg);background:var(--bg)}
+header{border-bottom:1px solid var(--line);padding:18px 32px;font-weight:600;letter-spacing:.2px}
+main{max-width:780px;margin:48px auto;padding:0 24px}
+h1{font-size:22px;margin:0 0 12px}
+h2{font-size:17px;margin:32px 0 8px}
+p{color:var(--muted);margin:10px 0}
+code{background:#f6f8fa;padding:2px 6px;border-radius:4px;font-size:13px}
+ul{padding-left:20px;color:var(--muted)}
+li{margin:6px 0}
+footer{margin-top:64px;border-top:1px solid var(--line);padding:18px 32px;font-size:13px;color:var(--muted)}
+</style>
+</head>
+<body>
+<header>engineering / notes</header>
+<main>
+<h1>Internal documentation mirror</h1>
+<p>This is a read-only mirror of internal engineering notes, synced from upstream weekly.</p>
+<p>Most pages are available under <code>/docs/</code> and <code>/changelog/</code>; some sections require signed access.</p>
+<h2>Available sections</h2>
+<ul>
+<li><code>/docs/getting-started</code> &mdash; onboarding and setup</li>
+<li><code>/docs/deployment</code> &mdash; rollout procedures</li>
+<li><code>/changelog/</code> &mdash; recent changes</li>
+</ul>
+<p>Last sync: <code>2026-09-22 03:14 UTC</code></p>
+</main>
+<footer>&copy; 2026 infra team &middot; edge node 04</footer>
+</body>
+</html>
+"""
+
+_FAKE_PAGE = _FAKE_PAGE_TPL.replace(b"__TITLE__", random.choice(_FAKE_TITLES).encode("utf-8"))
+_ROBOTS_TXT = b"User-agent: *\nAllow: /\n"
+# ==========================================
 
 
 def log(msg):
@@ -76,6 +131,49 @@ def remove_proxy_auth_header(request_data: bytes) -> bytes:
     return "\r\n".join(new_lines).encode("iso-8859-1")
 
 
+def parse_direct_request(request_data: bytes):
+    """判断是否为直连浏览器请求（非代理协议），返回 (method, path) 或 None"""
+    try:
+        text = request_data.decode("iso-8859-1", errors="replace")
+        first = text.split("\r\n", 1)[0].strip()
+        parts = first.split()
+        if len(parts) < 2:
+            return None
+        method, target = parts[0], parts[1]
+        if method.upper() == "CONNECT":
+            return None
+        if target.lower().startswith(("http://", "https://")):
+            return None
+        return method.upper(), target
+    except Exception:
+        return None
+
+
+def serve_fake_site(sock, target_path: str):
+    """所有直连请求统一返回伪装页"""
+    try:
+        if target_path == "/robots.txt":
+            body = _ROBOTS_TXT
+            hdr = (f"HTTP/1.1 200 OK\r\nServer: nginx/1.24.0\r\n"
+                   f"Content-Type: text/plain\r\nContent-Length: {len(body)}\r\n"
+                   f"Connection: close\r\n\r\n").encode("latin-1")
+            sock.sendall(hdr + body)
+            return
+        if target_path == "/favicon.ico":
+            sock.sendall(b"HTTP/1.1 204 No Content\r\nServer: nginx/1.24.0\r\nConnection: close\r\n\r\n")
+            return
+        # 其余全部返回伪装页
+        body = _FAKE_PAGE
+        hdr = (f"HTTP/1.1 200 OK\r\nServer: nginx/1.24.0\r\n"
+               f"Content-Type: text/html; charset=utf-8\r\n"
+               f"Content-Length: {len(body)}\r\n"
+               f"Cache-Control: public, max-age=3600\r\n"
+               f"Connection: close\r\n\r\n").encode("latin-1")
+        sock.sendall(hdr + body)
+    except Exception:
+        pass
+
+
 def send_407(client_socket):
     try:
         client_socket.sendall(
@@ -106,13 +204,6 @@ def make_tcp_socket():
 
 
 def tunnel(client_socket, server_socket):
-    """
-    非阻塞双向转发：
-      - select 监听可读 + 可写
-      - 用 bytearray 缓冲，避免 bytes += 的内存碎片
-      - 单向缓冲超限时暂停读该方向
-      - 双向都空闲 IDLE_TIMEOUT 秒才回收
-    """
     client_socket.setblocking(False)
     server_socket.setblocking(False)
 
@@ -235,13 +326,22 @@ def handle_client(client_socket, client_address):
         if not request_data:
             return
 
+        # ===== 伪装站点兜底 =====
+        direct = parse_direct_request(request_data)
+        if direct is not None:
+            _method, _path = direct
+            serve_fake_site(client_socket, _path)
+            return
+        # ========================
+
         if not check_proxy_auth(request_data):
             log_error(f"[AUTH FAILED] {client_address}")
             send_407(client_socket)
             return
 
         request_lines = request_data.decode("iso-8859-1").split("\r\n")
-        method, url, protocol = request_lines[0].split()
+        first = request_lines[0].split()
+        method, url = first[0], first[1]
 
         if method.upper() == "CONNECT":
             if ":" in url:
@@ -288,7 +388,6 @@ def main():
             print("\n服务器关闭中...")
             break
         except Exception as e:
-            # accept 异常绝不能退出主循环
             log_error(f"[ACCEPT ERROR] {e}")
             time.sleep(0.1)
             continue
@@ -298,7 +397,6 @@ def main():
             close_socket(client_socket)
             continue
 
-        global _alive_threads
         with _alive_lock:
             _alive_threads += 1
 
@@ -310,7 +408,6 @@ def main():
             )
             t.start()
         except RuntimeError as e:
-            # 系统线程上限，退避并释放资源
             log_error(f"[THREAD ERROR] {e}")
             with _alive_lock:
                 _alive_threads -= 1

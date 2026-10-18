@@ -7,16 +7,13 @@ import hmac
 import os
 import sys
 import time
-import random
 
 # ================= 配置区 =================
 PROXY_USER = os.environ.get("PROXY_USER", "")
 PROXY_PASS = os.environ.get("PROXY_PASS", "")
 LISTEN_HOST = os.environ.get("PROXY_HOST", "0.0.0.0")
-LISTEN_PORT = int(os.environ.get("PROXY_PORT", "3000"))
-
+LISTEN_PORT = int(os.environ.get("PROXY_PORT", "20095"))  # 适配你当前20095端口
 VERBOSE = os.environ.get("PROXY_VERBOSE", "false").lower() == "true"
-
 BUFFER_SIZE = 8192
 IDLE_TIMEOUT = 120
 CONNECT_TIMEOUT = 10
@@ -28,38 +25,34 @@ semaphore = threading.Semaphore(MAX_CONCURRENT)
 _alive_threads = 0
 _alive_lock = threading.Lock()
 
-# ================= 伪装页（新增，不动别处） =================
-_FAKE_PAGE = b"""<!doctype html><html lang=zh-CN><head><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1">
-<title>Engineering Notes</title>
-<style>body{margin:0;font:15px/1.65 system-ui,sans-serif;color:#1f2328;background:#fff}
-header{border-bottom:1px solid #d0d7de;padding:14px 28px;font-weight:600}
-main{max-width:760px;margin:40px auto;padding:0 22px}
-code{background:#f6f8fa;padding:1px 5px;border-radius:3px}
-footer{margin-top:56px;border-top:1px solid #d0d7de;padding:14px 28px;font-size:13px;color:#57606a}
-</style></head><body><header>engineering / notes</header><main>
-<h1>Internal documentation mirror</h1>
-<p>This is a read-only mirror of internal engineering notes, synced weekly.</p>
-<p>Please do not scan ports. Sections under <code>/docs/</code> require signed access.</p>
-</main><footer>&copy; 2026 infra team</footer></body></html>"""
+# ---------- 直连伪装页（新增） ----------
+_FAKE_PAGE = b"""<html><head><title>Engineering Notes</title>
+<style>body{font-family:sans-serif;background:#fff;color:#222;margin:40px;line-height:1.6}
+h1{border-bottom:1px solid #ccc}pre{background:#f4f4f4;padding:10px}</style></head>
+<body><h1>Engineering Notes</h1>
+<p>This endpoint is for authorized infrastructure use only.</p>
+<p><b>Please do not scan ports.</b></p>
+<pre>docs/ require access.</pre>
+</body></html>"""
 
-_MIS = [(403,"403 Forbidden"),(404,"404 Not Found"),(410,"410 Gone"),(503,"503 Service Unavailable")]
+_MISDIR = [(404,"404 Not Found"),(410,"410 Gone"),(403,"403 Forbidden"),
+           (503,"503 Service Unavailable"),(401,"401 Unauthorized")]
 
-def _serve_fake(sock):
+def _serve_fake(cs):
     try:
-        if not PROXY_USER:                       # 没配账号 → 迷惑码
-            code,text = random.choice(_MIS)
+        if not PROXY_USER:
+            code, text = _MISDIR[int(time.time()) % len(_MISDIR)]
         else:
-            code,text = 200,"200 OK"
+            code, text = 200, "200 OK"
         body = _FAKE_PAGE
-        sock.sendall((f"HTTP/1.1 {text}\r\nServer: nginx/1.24.0\r\n"
-                       f"Content-Type: text/html; charset=utf-8\r\n"
-                       f"Content-Length: {len(body)}\r\n"
-                       f"Connection: close\r\n\r\n").encode("latin-1") + body)
-    except Exception:
-        pass
+        hdr = (f"HTTP/1.1 {text}\r\nServer: nginx/1.24.0\r\n"
+               f"Content-Type: text/html; charset=utf-8\r\n"
+               f"Content-Length: {len(body)}\r\n"
+               f"Connection: close\r\n\r\n").encode("latin-1")
+        cs.sendall(hdr + body)
+    except Exception: pass
 
-def _is_direct(data: bytes) -> bool:
+def _is_direct(data):
     try:
         first = data.decode("iso-8859-1", errors="replace").split("\r\n",1)[0].strip()
         p = first.split()
@@ -67,9 +60,8 @@ def _is_direct(data: bytes) -> bool:
         if p[0].upper() == "CONNECT": return False
         if p[1].lower().startswith(("http://","https://")): return False
         return True
-    except Exception:
-        return False
-# =========================================================
+    except Exception: return False
+# --------------------------------
 
 def log(msg):
     if VERBOSE:
@@ -84,24 +76,20 @@ def check_proxy_auth(request_data: bytes) -> bool:
         headers = text.split("\r\n")
         auth_value = None
         for line in headers[1:]:
-            if not line:
-                break
+            if not line: break
             if ":" in line:
                 key, value = line.split(":", 1)
                 if key.strip().lower() == "proxy-authorization":
                     auth_value = value.strip()
                     break
-        if not auth_value:
-            return False
+        if not auth_value: return False
         parts = auth_value.split(None, 1)
-        if len(parts) != 2 or parts[0].lower() != "basic":
-            return False
+        if len(parts) != 2 or parts[0].lower() != "basic": return False
         decoded = base64.b64decode(parts[1]).decode("utf-8")
         username, password = decoded.split(":", 1)
         return (hmac.compare_digest(username, PROXY_USER)
                 and hmac.compare_digest(password, PROXY_PASS))
-    except Exception:
-        return False
+    except Exception: return False
 
 def remove_proxy_auth_header(request_data: bytes) -> bytes:
     text = request_data.decode("iso-8859-1")
@@ -110,31 +98,24 @@ def remove_proxy_auth_header(request_data: bytes) -> bytes:
     for line in lines:
         if ":" in line:
             key = line.split(":", 1)[0].strip().lower()
-            if key == "proxy-authorization":
-                continue
+            if key == "proxy-authorization": continue
         new_lines.append(line)
     return "\r\n".join(new_lines).encode("iso-8859-1")
 
 def send_407(client_socket):
     try:
-        # ← 这里顺手修了原来的引号嵌套问题
         client_socket.sendall(
             b"HTTP/1.1 407 Proxy Authentication Required\r\n"
-            b'Proxy-Authenticate: Basic realm="Proxy"\r\n'
+            b'Proxy-Authenticate: Basic realm="Proxy"\r\n'  # 引号已修
             b"Content-Length: 0\r\nConnection: close\r\n\r\n"
         )
-    except Exception:
-        pass
+    except Exception: pass
 
 def close_socket(sock):
-    try:
-        sock.shutdown(socket.SHUT_RDWR)
-    except Exception:
-        pass
-    try:
-        sock.close()
-    except Exception:
-        pass
+    try: sock.shutdown(socket.SHUT_RDWR)
+    except Exception: pass
+    try: sock.close()
+    except Exception: pass
 
 def make_tcp_socket():
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -145,50 +126,30 @@ def make_tcp_socket():
 def tunnel(client_socket, server_socket):
     client_socket.setblocking(False)
     server_socket.setblocking(False)
-
     peer = {client_socket: server_socket, server_socket: client_socket}
     pending = {client_socket: bytearray(), server_socket: bytearray()}
-
     while True:
         write_list = [s for s in (client_socket, server_socket) if pending[s]]
         try:
             rlist, wlist, xlist = select.select(
-                [client_socket, server_socket],
-                write_list,
-                [client_socket, server_socket],
-                IDLE_TIMEOUT,
-            )
-        except (OSError, ValueError):
-            return
-
-        if xlist or (not rlist and not wlist):
-            return
-
+                [client_socket, server_socket], write_list,
+                [client_socket, server_socket], IDLE_TIMEOUT)
+        except (OSError, ValueError): return
+        if xlist or (not rlist and not wlist): return
         for s in rlist:
-            if len(pending[peer[s]]) > MAX_BUFFER:
-                continue
-            try:
-                data = s.recv(BUFFER_SIZE)
-            except (BlockingIOError, InterruptedError):
-                continue
-            except Exception:
-                return
-            if not data:
-                return
+            if len(pending[peer[s]]) > MAX_BUFFER: continue
+            try: data = s.recv(BUFFER_SIZE)
+            except (BlockingIOError, InterruptedError): continue
+            except Exception: return
+            if not data: return
             pending[peer[s]] += data
-
         for s in wlist:
             buf = pending[s]
-            if not buf:
-                continue
-            try:
-                n = s.send(buf)
-            except (BlockingIOError, InterruptedError):
-                continue
-            except Exception:
-                return
-            if n <= 0:
-                return
+            if not buf: continue
+            try: n = s.send(buf)
+            except (BlockingIOError, InterruptedError): continue
+            except Exception: return
+            if n <= 0: return
             del buf[:n]
 
 def handle_connect(client_socket, hostname, port):
@@ -199,33 +160,23 @@ def handle_connect(client_socket, hostname, port):
         server_socket.connect((hostname, port))
     except Exception as e:
         log_error(f"[CONNECT ERROR] {hostname}:{port} {e}")
-        try:
-            client_socket.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-        except Exception:
-            pass
-        if server_socket:
-            close_socket(server_socket)
+        try: client_socket.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+        except Exception: pass
+        if server_socket: close_socket(server_socket)
         return
-
     try:
         client_socket.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
     except Exception:
-        close_socket(server_socket)
-        return
-
-    try:
-        tunnel(client_socket, server_socket)
+        close_socket(server_socket); return
+    try: tunnel(client_socket, server_socket)
     finally:
-        close_socket(client_socket)
-        close_socket(server_socket)
+        close_socket(client_socket); close_socket(server_socket)
 
 def handle_http(client_socket, request_data, url):
     url_parts = urllib.parse.urlparse(url)
     hostname = url_parts.hostname
     port = url_parts.port or 80
-    if not hostname:
-        return
-
+    if not hostname: return
     server_socket = None
     try:
         server_socket = make_tcp_socket()
@@ -233,117 +184,78 @@ def handle_http(client_socket, request_data, url):
         server_socket.connect((hostname, port))
     except Exception as e:
         log_error(f"[HTTP ERROR] {hostname}:{port} {e}")
-        try:
-            client_socket.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-        except Exception:
-            pass
-        if server_socket:
-            close_socket(server_socket)
+        try: client_socket.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+        except Exception: pass
+        if server_socket: close_socket(server_socket)
         return
-
-    try:
-        server_socket.sendall(remove_proxy_auth_header(request_data))
-    except Exception:
-        close_socket(server_socket)
-        return
-
-    try:
-        tunnel(client_socket, server_socket)
-    finally:
-        close_socket(server_socket)
+    try: server_socket.sendall(remove_proxy_auth_header(request_data))
+    except Exception: close_socket(server_socket); return
+    try: tunnel(client_socket, server_socket)
+    finally: close_socket(server_socket)
 
 def handle_client(client_socket, client_address):
-    global _alive_threads
+    global _alive_threads  # 原逻辑保留
     try:
         client_socket.settimeout(CONNECT_TIMEOUT)
         request_data = client_socket.recv(BUFFER_SIZE)
-        if not request_data:
-            return
+        if not request_data: return
 
-        # ===== 唯一新增点：直连伪装，原逻辑不动 =====
+        # 直连伪装（新增）
         if _is_direct(request_data):
             _serve_fake(client_socket)
             return
-        # ============================================
 
         if not check_proxy_auth(request_data):
             log_error(f"[AUTH FAILED] {client_address}")
-            send_407(client_socket)
-            return
-
+            send_407(client_socket); return
         request_lines = request_data.decode("iso-8859-1").split("\r\n")
         method, url, protocol = request_lines[0].split()
-
         if method.upper() == "CONNECT":
-            if ":" in url:
-                hostname, port = url.rsplit(":", 1)
-                port = int(port)
-            else:
-                hostname, port = url, 443
+            if ":" in url: hostname, port = url.rsplit(":", 1); port = int(port)
+            else: hostname, port = url, 443
             log(f"[CONNECT] {client_address} -> {hostname}:{port}")
-            handle_connect(client_socket, hostname, port)
-            return
-
+            handle_connect(client_socket, hostname, port); return
         log(f"[{method}] {client_address} -> {url}")
         handle_http(client_socket, request_data, url)
-
-    except (socket.timeout, ConnectionResetError, BrokenPipeError, OSError):
-        pass
-    except Exception as e:
-        log_error(f"[ERROR] {client_address}: {e}")
+    except (socket.timeout, ConnectionResetError, BrokenPipeError, OSError): pass
+    except Exception as e: log_error(f"[ERROR] {client_address}: {e}")
     finally:
         close_socket(client_socket)
         with _alive_lock:
             _alive_threads -= 1
             n = _alive_threads
         semaphore.release()
-        if VERBOSE and n % 50 == 0:
-            log(f"[STATUS] 当前活跃连接：{n}")
+        if VERBOSE and n % 50 == 0: log(f"[STATUS] 当前活跃连接：{n}")
 
 def main():
+    global _alive_threads  # ★ 修复：原代码此处漏了 global，导致 += 时崩溃
     server_socket = make_tcp_socket()
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind((LISTEN_HOST, LISTEN_PORT))
     server_socket.listen(200)
-
     print(f"代理服务器已启动：{LISTEN_HOST}:{LISTEN_PORT}")
     print(f"用户：{PROXY_USER}   VERBOSE：{VERBOSE}")
     print(f"空闲超时：{IDLE_TIMEOUT}s   最大并发：{MAX_CONCURRENT}")
     print("-" * 50, flush=True)
-
     while True:
         try:
             client_socket, client_address = server_socket.accept()
         except KeyboardInterrupt:
-            print("\n服务器关闭中...")
-            break
+            print("\n服务器关闭中..."); break
         except Exception as e:
-            log_error(f"[ACCEPT ERROR] {e}")
-            time.sleep(0.1)
-            continue
-
+            log_error(f"[ACCEPT ERROR] {e}"); time.sleep(0.1); continue
         if not semaphore.acquire(blocking=False):
             log_error(f"[REJECT] 并发超限，拒绝 {client_address}")
-            close_socket(client_socket)
-            continue
-
+            close_socket(client_socket); continue
         with _alive_lock:
             _alive_threads += 1
-
         try:
-            t = threading.Thread(
-                target=handle_client,
-                args=(client_socket, client_address),
-                daemon=True,
-            )
+            t = threading.Thread(target=handle_client, args=(client_socket, client_address), daemon=True)
             t.start()
         except RuntimeError as e:
             log_error(f"[THREAD ERROR] {e}")
-            with _alive_lock:
-                _alive_threads -= 1
-            semaphore.release()
-            close_socket(client_socket)
-            time.sleep(0.5)
+            with _alive_lock: _alive_threads -= 1
+            semaphore.release(); close_socket(client_socket); time.sleep(0.5)
 
 if __name__ == "__main__":
     main()

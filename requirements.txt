@@ -1,1 +1,2 @@
-
+# proxy.py — stdlib-only forward proxy with fake-site camouflage
+# Runtime: python>=3.8

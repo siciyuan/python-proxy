@@ -1,261 +1,159 @@
 import socket
-import select
 import threading
-import urllib.parse
+import select
 import base64
-import hmac
 import os
-import sys
-import time
 
-# ================= 配置区 =================
-PROXY_USER = os.environ.get("PROXY_USER", "")
-PROXY_PASS = os.environ.get("PROXY_PASS", "")
-LISTEN_HOST = os.environ.get("PROXY_HOST", "0.0.0.0")
-LISTEN_PORT = int(os.environ.get("PROXY_PORT", "20095"))  # 适配你当前20095端口
-VERBOSE = os.environ.get("PROXY_VERBOSE", "false").lower() == "true"
-BUFFER_SIZE = 8192
-IDLE_TIMEOUT = 120
-CONNECT_TIMEOUT = 10
-MAX_CONCURRENT = 400
-MAX_BUFFER = 2 * 1024 * 1024
-# ==========================================
+LISTEN_HOST = '0.0.0.0'
+LISTEN_PORT = 20095
+FORCE_IPV4 = True
 
-semaphore = threading.Semaphore(MAX_CONCURRENT)
-_alive_threads = 0
-_alive_lock = threading.Lock()
+# 1. 认证配置 (修改为你自己的账号密码)
+AUTH_USER = "user"
+AUTH_PASS = "pass123"
+AUTH_STRING = f"{AUTH_USER}:{AUTH_PASS}".encode('utf-8')
+EXPECTED_AUTH = base64.b64encode(AUTH_STRING).decode('utf-8')
 
-# ---------- 直连伪装页（新增） ----------
-_FAKE_PAGE = b"""<html><head><title>Engineering Notes</title>
-<style>body{font-family:sans-serif;background:#fff;color:#222;margin:40px;line-height:1.6}
-h1{border-bottom:1px solid #ccc}pre{background:#f4f4f4;padding:10px}</style></head>
-<body><h1>Engineering Notes</h1>
-<p>This endpoint is for authorized infrastructure use only.</p>
-<p><b>Please do not scan ports.</b></p>
-<pre>docs/ require access.</pre>
-</body></html>"""
-
-_MISDIR = [(404,"404 Not Found"),(410,"410 Gone"),(403,"403 Forbidden"),
-           (503,"503 Service Unavailable"),(401,"401 Unauthorized")]
-
-def _serve_fake(cs):
+def set_keepalive(sock):
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     try:
-        if not PROXY_USER:
-            code, text = _MISDIR[int(time.time()) % len(_MISDIR)]
-        else:
-            code, text = 200, "200 OK"
-        body = _FAKE_PAGE
-        hdr = (f"HTTP/1.1 {text}\r\nServer: nginx/1.24.0\r\n"
-               f"Content-Type: text/html; charset=utf-8\r\n"
-               f"Content-Length: {len(body)}\r\n"
-               f"Connection: close\r\n\r\n").encode("latin-1")
-        cs.sendall(hdr + body)
-    except Exception: pass
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 20)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)
+    except (AttributeError, OSError):
+        pass
 
-def _is_direct(data):
+def fake_web_response():
+    # 2. 网页伪装：访问 IP:端口 时返回的假页面 (类似 ip138 查询网风格)
+    html = """
+    <!DOCTYPE html><html><head><meta charset="utf-8">
+    <title>查询网 iP138.com</title>
+    <style>body{font-family:sans-serif;text-align:center;margin-top:50px;}
+    h1{color:#2b85e4;} .box{background:#f5f5f5;padding:20px;border-radius:8px;display:inline-block;}</style>
+    </head><body>
+    <h1>iP查询</h1><div class="box">
+    <h2>iP地址归属地查询</h2>
+    <p>您的访问已记录。</p>
+    <p><small>OVH Hosting / France</small></p>
+    </div></body></html>
+    """
+    return (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Content-Type: text/html; charset=utf-8\r\n"
+        b"Server: nginx/1.18.0\r\n"
+        b"Connection: close\r\n\r\n" + html.encode('utf-8')
+    )
+
+def handle_client(local_sock):
+    remote_sock = None
     try:
-        first = data.decode("iso-8859-1", errors="replace").split("\r\n",1)[0].strip()
-        p = first.split()
-        if len(p) < 2: return False
-        if p[0].upper() == "CONNECT": return False
-        if p[1].lower().startswith(("http://","https://")): return False
-        return True
-    except Exception: return False
-# --------------------------------
-
-def log(msg):
-    if VERBOSE:
-        print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
-
-def log_error(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
-
-def check_proxy_auth(request_data: bytes) -> bool:
-    try:
-        text = request_data.decode("iso-8859-1")
-        headers = text.split("\r\n")
-        auth_value = None
-        for line in headers[1:]:
-            if not line: break
-            if ":" in line:
-                key, value = line.split(":", 1)
-                if key.strip().lower() == "proxy-authorization":
-                    auth_value = value.strip()
-                    break
-        if not auth_value: return False
-        parts = auth_value.split(None, 1)
-        if len(parts) != 2 or parts[0].lower() != "basic": return False
-        decoded = base64.b64decode(parts[1]).decode("utf-8")
-        username, password = decoded.split(":", 1)
-        return (hmac.compare_digest(username, PROXY_USER)
-                and hmac.compare_digest(password, PROXY_PASS))
-    except Exception: return False
-
-def remove_proxy_auth_header(request_data: bytes) -> bytes:
-    text = request_data.decode("iso-8859-1")
-    lines = text.split("\r\n")
-    new_lines = []
-    for line in lines:
-        if ":" in line:
-            key = line.split(":", 1)[0].strip().lower()
-            if key == "proxy-authorization": continue
-        new_lines.append(line)
-    return "\r\n".join(new_lines).encode("iso-8859-1")
-
-def send_407(client_socket):
-    try:
-        client_socket.sendall(
-            b"HTTP/1.1 407 Proxy Authentication Required\r\n"
-            b'Proxy-Authenticate: Basic realm="Proxy"\r\n'  # 引号已修
-            b"Content-Length: 0\r\nConnection: close\r\n\r\n"
-        )
-    except Exception: pass
-
-def close_socket(sock):
-    try: sock.shutdown(socket.SHUT_RDWR)
-    except Exception: pass
-    try: sock.close()
-    except Exception: pass
-
-def make_tcp_socket():
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    return s
-
-def tunnel(client_socket, server_socket):
-    client_socket.setblocking(False)
-    server_socket.setblocking(False)
-    peer = {client_socket: server_socket, server_socket: client_socket}
-    pending = {client_socket: bytearray(), server_socket: bytearray()}
-    while True:
-        write_list = [s for s in (client_socket, server_socket) if pending[s]]
-        try:
-            rlist, wlist, xlist = select.select(
-                [client_socket, server_socket], write_list,
-                [client_socket, server_socket], IDLE_TIMEOUT)
-        except (OSError, ValueError): return
-        if xlist or (not rlist and not wlist): return
-        for s in rlist:
-            if len(pending[peer[s]]) > MAX_BUFFER: continue
-            try: data = s.recv(BUFFER_SIZE)
-            except (BlockingIOError, InterruptedError): continue
-            except Exception: return
-            if not data: return
-            pending[peer[s]] += data
-        for s in wlist:
-            buf = pending[s]
-            if not buf: continue
-            try: n = s.send(buf)
-            except (BlockingIOError, InterruptedError): continue
-            except Exception: return
-            if n <= 0: return
-            del buf[:n]
-
-def handle_connect(client_socket, hostname, port):
-    server_socket = None
-    try:
-        server_socket = make_tcp_socket()
-        server_socket.settimeout(CONNECT_TIMEOUT)
-        server_socket.connect((hostname, port))
-    except Exception as e:
-        log_error(f"[CONNECT ERROR] {hostname}:{port} {e}")
-        try: client_socket.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-        except Exception: pass
-        if server_socket: close_socket(server_socket)
-        return
-    try:
-        client_socket.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-    except Exception:
-        close_socket(server_socket); return
-    try: tunnel(client_socket, server_socket)
-    finally:
-        close_socket(client_socket); close_socket(server_socket)
-
-def handle_http(client_socket, request_data, url):
-    url_parts = urllib.parse.urlparse(url)
-    hostname = url_parts.hostname
-    port = url_parts.port or 80
-    if not hostname: return
-    server_socket = None
-    try:
-        server_socket = make_tcp_socket()
-        server_socket.settimeout(CONNECT_TIMEOUT)
-        server_socket.connect((hostname, port))
-    except Exception as e:
-        log_error(f"[HTTP ERROR] {hostname}:{port} {e}")
-        try: client_socket.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-        except Exception: pass
-        if server_socket: close_socket(server_socket)
-        return
-    try: server_socket.sendall(remove_proxy_auth_header(request_data))
-    except Exception: close_socket(server_socket); return
-    try: tunnel(client_socket, server_socket)
-    finally: close_socket(server_socket)
-
-def handle_client(client_socket, client_address):
-    global _alive_threads  # 原逻辑保留
-    try:
-        client_socket.settimeout(CONNECT_TIMEOUT)
-        request_data = client_socket.recv(BUFFER_SIZE)
-        if not request_data: return
-
-        # 直连伪装（新增）
-        if _is_direct(request_data):
-            _serve_fake(client_socket)
+        local_sock.settimeout(10)
+        data = b''
+        while b'\r\n\r\n' not in data:
+            chunk = local_sock.recv(4096)
+            if not chunk: break
+            data += chunk
+        
+        if not data: return
+        
+        # --- 网页伪装逻辑 ---
+        # 如果直接访问 IP:端口 (GET /)，返回假网页，不要求认证
+        if data.startswith(b'GET /') and b'Proxy-Connection' not in data:
+            local_sock.send(fake_web_response())
             return
 
-        if not check_proxy_auth(request_data):
-            log_error(f"[AUTH FAILED] {client_address}")
-            send_407(client_socket); return
-        request_lines = request_data.decode("iso-8859-1").split("\r\n")
-        method, url, protocol = request_lines[0].split()
-        if method.upper() == "CONNECT":
-            if ":" in url: hostname, port = url.rsplit(":", 1); port = int(port)
-            else: hostname, port = url, 443
-            log(f"[CONNECT] {client_address} -> {hostname}:{port}")
-            handle_connect(client_socket, hostname, port); return
-        log(f"[{method}] {client_address} -> {url}")
-        handle_http(client_socket, request_data, url)
-    except (socket.timeout, ConnectionResetError, BrokenPipeError, OSError): pass
-    except Exception as e: log_error(f"[ERROR] {client_address}: {e}")
+        # --- 认证逻辑 (仅针对代理请求) ---
+        auth_ok = False
+        if FORCE_IPV4: # 简单校验基础代理头
+            if data.startswith(b'CONNECT') or data.startswith(b'GET') or data.startswith(b'POST'):
+                # 提取 Proxy-Authorization
+                auth_line = [l for l in data.split(b'\r\n') if l.lower().startswith(b'proxy-authorization')]
+                if auth_line:
+                    try:
+                        # 格式: Basic base64(user:pass)
+                        token = auth_line[0].split(b' ')[-1].decode('utf-8').strip()
+                        if token == EXPECTED_AUTH:
+                            auth_ok = True
+                    except: pass
+                
+                if not auth_ok:
+                    # 返回 407 要求认证
+                    local_sock.send(b'HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm="iP138"\r\n\r\n')
+                    return
+            else:
+                # 非标准请求直接断开
+                return
+        
+        # --- 解析目标 ---
+        is_connect = data.startswith(b'CONNECT')
+        if is_connect:
+            host_port = data.split(b' ')[1].decode('utf-8')
+            host, port = host_port.split(':')
+            port = int(port)
+        else:
+            # 简单解析 HTTP 目标
+            host_line = [l for l in data.split(b'\r\n') if l.lower().startswith(b'host')]
+            if not host_line: return
+            host = host_line[0].split(b':')[1].strip().decode('utf-8')
+            port = 80
+
+        # --- 强制 IPv4 连接 ---
+        addr_info = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM, 0)
+        if not addr_info: return
+        af, socktype, proto, canonname, sa = addr_info[0]
+        
+        remote_sock = socket.socket(af, socktype, proto)
+        remote_sock.settimeout(10)
+        remote_sock.connect(sa)
+        remote_sock.settimeout(None)
+        set_keepalive(remote_sock)
+        set_keepalive(local_sock)
+
+        # --- 响应与转发 ---
+        if is_connect:
+            local_sock.send(b'HTTP/1.1 200 Connection Established\r\n\r\n')
+            # 剥离头，发送剩余数据
+            header_end = data.find(b'\r\n\r\n') + 4
+            if len(data) > header_end:
+                remote_sock.send(data[header_end:])
+        else:
+            # 转发原始 HTTP (含 Host)，远端会自动处理
+            remote_sock.send(data)
+
+        # 双向透明转发 (WebSocket 兼容)
+        while True:
+            r, _, x = select.select([local_sock, remote_sock], [], [local_sock, remote_sock], 60)
+            if x: break
+            if not r: continue
+            
+            if local_sock in r:
+                d = local_sock.recv(65535)
+                if not d: break
+                remote_sock.sendall(d)
+            if remote_sock in r:
+                d = remote_sock.recv(65535)
+                if not d: break
+                local_sock.sendall(d)
+
+    except Exception:
+        pass
     finally:
-        close_socket(client_socket)
-        with _alive_lock:
-            _alive_threads -= 1
-            n = _alive_threads
-        semaphore.release()
-        if VERBOSE and n % 50 == 0: log(f"[STATUS] 当前活跃连接：{n}")
+        try: local_sock.close()
+        except: pass
+        try: remote_sock.close()
+        except: pass
 
 def main():
-    global _alive_threads  # ★ 修复：原代码此处漏了 global，导致 += 时崩溃
-    server_socket = make_tcp_socket()
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind((LISTEN_HOST, LISTEN_PORT))
-    server_socket.listen(200)
-    print(f"代理服务器已启动：{LISTEN_HOST}:{LISTEN_PORT}")
-    print(f"用户：{PROXY_USER}   VERBOSE：{VERBOSE}")
-    print(f"空闲超时：{IDLE_TIMEOUT}s   最大并发：{MAX_CONCURRENT}")
-    print("-" * 50, flush=True)
-    while True:
-        try:
-            client_socket, client_address = server_socket.accept()
-        except KeyboardInterrupt:
-            print("\n服务器关闭中..."); break
-        except Exception as e:
-            log_error(f"[ACCEPT ERROR] {e}"); time.sleep(0.1); continue
-        if not semaphore.acquire(blocking=False):
-            log_error(f"[REJECT] 并发超限，拒绝 {client_address}")
-            close_socket(client_socket); continue
-        with _alive_lock:
-            _alive_threads += 1
-        try:
-            t = threading.Thread(target=handle_client, args=(client_socket, client_address), daemon=True)
-            t.start()
-        except RuntimeError as e:
-            log_error(f"[THREAD ERROR] {e}")
-            with _alive_lock: _alive_threads -= 1
-            semaphore.release(); close_socket(client_socket); time.sleep(0.5)
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((LISTEN_HOST, LISTEN_PORT))
+    s.listen(50)
+    print(f"[*] Proxy on {LISTEN_HOST}:{LISTEN_PORT} | Auth: ON | ForceIPv4: {FORCE_IPV4} | FakeWeb: ON")
 
-if __name__ == "__main__":
+    while True:
+        cli, addr = s.accept()
+        t = threading.Thread(target=handle_client, args=(cli,), daemon=True)
+        t.start()
+
+if __name__ == '__main__':
     main()
